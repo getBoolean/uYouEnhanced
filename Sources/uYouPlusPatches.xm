@@ -3,6 +3,7 @@
 # pragma mark - YouTube patches
 
 // Fix Google Sign in by @PoomSmart and @level3tjg (qnblackcat/uYouPlus#684)
+%group gGoogleSignInPatch
 %hook NSBundle
 - (NSDictionary *)infoDictionary {
     NSMutableDictionary *info = %orig.mutableCopy;
@@ -10,6 +11,7 @@
         info[@"CFBundleIdentifier"] = @"com.google.ios.youtube";
     return info;
 }
+%end
 %end
 
 // Workaround for MiRO92/uYou-for-YouTube#12, qnblackcat/uYouPlus#263
@@ -96,6 +98,7 @@ typedef NS_ENUM(NSInteger, ShareEntityType) {
     ShareEntityFieldVideo = 1,
     ShareEntityFieldPlaylist = 2,
     ShareEntityFieldChannel = 3,
+    ShareEntityFieldPost = 6,
     ShareEntityFieldClip = 8
 };
 
@@ -109,7 +112,7 @@ static inline NSString* extractIdWithFormat(GPBUnknownFieldSet *fields, NSIntege
     return [NSString stringWithFormat:format, id];
 }
 
-static BOOL showNativeShareSheet(NSString *serializedShareEntity) {
+static BOOL showNativeShareSheet(NSString *serializedShareEntity, UIView *sourceView) {
     GPBMessage *shareEntity = [%c(GPBMessage) deserializeFromString:serializedShareEntity];
     GPBUnknownFieldSet *fields = shareEntity.unknownFields;
     NSString *shareUrl;
@@ -117,7 +120,7 @@ static BOOL showNativeShareSheet(NSString *serializedShareEntity) {
     if ([fields hasField:ShareEntityFieldClip]) {
         GPBUnknownField *shareEntityClip = [fields getField:ShareEntityFieldClip];
         if ([shareEntityClip.lengthDelimitedList count] != 1)
-            return FALSE;
+            return NO;
         GPBMessage *clipMessage = [%c(GPBMessage) parseFromData:[shareEntityClip.lengthDelimitedList firstObject] error:nil];
         shareUrl = extractIdWithFormat(clipMessage.unknownFields, 1, @"https://youtube.com/clip/%@");
     }
@@ -138,36 +141,38 @@ static BOOL showNativeShareSheet(NSString *serializedShareEntity) {
         shareUrl = extractIdWithFormat(fields, ShareEntityFieldVideo, @"https://youtube.com/watch?v=%@");
 
     if (!shareUrl)
-        return FALSE;
+        shareUrl = extractIdWithFormat(fields, ShareEntityFieldPost, @"https://youtube.com/post/%@");
 
-    UIActivityViewController *activityViewController = [[UIActivityViewController alloc]initWithActivityItems:@[shareUrl] applicationActivities:nil];
-    [[%c(YTUIUtils) topViewControllerForPresenting] presentViewController:activityViewController animated:YES completion:^{}];
-    return TRUE;
+    if (!shareUrl)
+        return NO;
+
+    UIActivityViewController *activityViewController = [[UIActivityViewController alloc] initWithActivityItems:@[shareUrl] applicationActivities:nil];
+    activityViewController.excludedActivityTypes = @[UIActivityTypeAssignToContact, UIActivityTypePrint];
+
+    UIViewController *topViewController = [%c(YTUIUtils) topViewControllerForPresenting];
+
+    if (activityViewController.popoverPresentationController) {
+        activityViewController.popoverPresentationController.sourceView = topViewController.view;
+        activityViewController.popoverPresentationController.sourceRect = [sourceView convertRect:sourceView.bounds toView:topViewController.view];
+    }
+
+    [topViewController presentViewController:activityViewController animated:YES completion:nil];
+
+    return YES;
 }
-
 
 /* -------------------- iPad Layout -------------------- */
 
-/*
-%hook YTShareRequestViewController
-- (id)initWithService:(id)_service parentResponder:(id)_parentResponder {
-    // disable the default share sheet behavior and force the app to call [YTAccountScopedCommandRouter handleCommand]
-    return NULL;
-}
-%end
-*/
-
-%hook YTAccountScopedCommandRouter
-- (BOOL)handleCommand:(id)command entry:(id)_entry fromView:(id)_fromView sender:(id)_sender completionBlock:(id)_completionBlock {
+%hook YTAccountScopedCommandResponderEvent
+- (void)send {
     GPBExtensionDescriptor *shareEntityEndpointDescriptor = [%c(YTIShareEntityEndpoint) shareEntityEndpoint];
-    if (![command hasExtension:shareEntityEndpointDescriptor])
+    if (![self.command hasExtension:shareEntityEndpointDescriptor])
         return %orig;
-    YTIShareEntityEndpoint *shareEntityEndpoint = [command getExtension:shareEntityEndpointDescriptor];
-    if(!shareEntityEndpoint.hasSerializedShareEntity)
+    YTIShareEntityEndpoint *shareEntityEndpoint = [self.command getExtension:shareEntityEndpointDescriptor];
+    if (!shareEntityEndpoint.hasSerializedShareEntity)
         return %orig;
-    if (!showNativeShareSheet(shareEntityEndpoint.serializedShareEntity))
+    if (!showNativeShareSheet(shareEntityEndpoint.serializedShareEntity, self.fromView))
         return %orig;
-    return TRUE;
 }
 %end
 
@@ -175,7 +180,7 @@ static BOOL showNativeShareSheet(NSString *serializedShareEntity) {
 /* ------------------- iPhone Layout ------------------- */
 
 %hook ELMPBShowActionSheetCommand
-- (void)executeWithCommandContext:(id)_context handler:(id)_handler {
+- (void)executeWithCommandContext:(ELMCommandContext*)context handler:(id)_handler {
     if (!self.hasOnAppear)
         return %orig;
     GPBExtensionDescriptor *innertubeCommandDescriptor = [%c(YTIInnertubeCommandExtensionRoot) innertubeCommand];
@@ -188,10 +193,12 @@ static BOOL showNativeShareSheet(NSString *serializedShareEntity) {
     YTIUpdateShareSheetCommand *updateShareSheetCommand = [innertubeCommand getExtension:updateShareSheetCommandDescriptor];
     if (!updateShareSheetCommand.hasSerializedShareEntity)
         return %orig;
-    if (!showNativeShareSheet(updateShareSheetCommand.serializedShareEntity))
+    if (!showNativeShareSheet(updateShareSheetCommand.serializedShareEntity, context.context.fromView))
         return %orig;
 }
 %end
+
+//
 
 // iOS 16 uYou crash fix - @level3tjg: https://github.com/qnblackcat/uYouPlus/pull/224
 // %group iOS16
@@ -330,6 +337,9 @@ static void refreshUYouAppearance() {
 
 %ctor {
     %init;
+    if (IS_ENABLED(@"googleSignInPatch_enabled")) {
+        %init(gGoogleSignInPatch);
+    }
     // if (@available(iOS 16, *)) {
     //     %init(iOS16);
     // }
